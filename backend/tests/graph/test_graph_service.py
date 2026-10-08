@@ -1,4 +1,5 @@
 
+import json
 import os
 
 import pytest
@@ -138,3 +139,50 @@ async def test_run_extraction_doc_aborts_when_source_deleted_mid_flight(db_sessi
     log = (await db_session.execute(select(GraphExtractLog).where(
         GraphExtractLog.note_id == "md51"))).scalars().all()
     assert log == []
+
+
+@pytest.mark.asyncio
+async def test_process_task_doc_body_rebuilt_from_chunks(db_session, session_factory, monkeypatch):
+    """回归：doc 任务 payload 只带 chunks（无 text）时，正文必须由切片拼回。
+
+    背景：知识库上传管线入队 payload 为 {"chunks": [...]}，不含 text；
+    process_task 原先取 payload.get("text", "") 得到空串，extract_entities
+    以空正文调用 LLM → 抽出 0 个实体却仍判定 success（图谱静默为空）。
+    """
+    from app.core.background_init import init_manager
+    from app.graph.schemas.graph import ExtractResult
+    from app.graph.services.graph_service import process_task
+
+    monkeypatch.setattr(init_manager, "chat_model",
+                        make_fake_chat_model(['{"entities": [], "relations": []}']))
+    monkeypatch.setattr("app.graph.services.graph_service.AsyncSessionLocal", session_factory)
+
+    # Neo4j 存储替身：所有方法均 async 返回空列表（本用例只关心传给抽取的正文）
+    class _AsyncStoreStub:
+        def __getattr__(self, _name):
+            async def _call(*_args, **_kwargs):
+                return []
+            return _call
+
+    monkeypatch.setattr("app.graph.services.graph_service.get_graph_store",
+                        lambda _db: _AsyncStoreStub())
+
+    chunks = [{"chunk_index": 0, "text": "第一段内容"},
+              {"chunk_index": 1, "text": "第二段内容"}]
+    db_session.add(GraphDoc(id="md51", user_id="u1", filename="报告.pdf"))
+    db_session.add(GraphBuildTask(
+        id="t1", user_id="u1", source_type="doc", source_id="md51", title="报告.pdf",
+        content_hash="h", payload=json.dumps({"chunks": chunks}),
+        status="running", attempts=0, force=False, run_token="rt"))
+    await db_session.commit()
+
+    seen = {}
+
+    async def _fake_extract(title, content, chat_model):
+        seen["title"], seen["content"] = title, content
+        return ExtractResult(entities=[], relations=[])
+
+    monkeypatch.setattr("app.graph.services.graph_service.extract_entities", _fake_extract)
+
+    assert await process_task("t1", "rt") is True
+    assert seen["content"] == "第一段内容\n第二段内容", "doc 正文未由 chunks 拼回，抽取会拿到空正文"

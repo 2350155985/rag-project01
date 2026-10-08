@@ -1,4 +1,6 @@
 """document_handler/processor.py — DocumentProcessor 测试（loader 全部打桩）。"""
+import asyncio
+
 import pytest
 from langchain_core.documents import Document
 
@@ -123,3 +125,78 @@ class TestSplitDocumentsSync:
     def test_empty_documents(self):
         processor = _processor()
         assert processor.split_documents_sync([]) == []
+
+
+class _Upload:
+    """最小 UploadFile 替身。"""
+
+    def __init__(self, filename, data):
+        self.filename = filename
+        self._data = data
+
+    async def read(self):
+        return self._data
+
+    async def seek(self, *_):
+        return 0
+
+
+class _Md5Store:
+    """记录 save_md5_hex 调用；check 恒为未命中。"""
+
+    def __init__(self):
+        self.saved = []
+
+    async def check_md5_hex(self, *_):
+        return False
+
+    async def save_md5_hex(self, md5, filename, original_filename, user_id):
+        self.saved.append((md5, filename, original_filename, user_id))
+
+
+class TestGetDocumentTempFileFlush:
+    """回归：get_document 写临时文件后必须 flush + close。
+
+    背景：tempfile.NamedTemporaryFile 默认带缓冲（8KB），小文件写完若不落盘，
+    loader 用新句柄读取会得到空内容 → 切分为 0 块 → 接口仍返回"上传成功"，
+    但知识库实际什么都没入库（日志只留一句「切分内容为空，跳过」）。
+
+    本测试让 loader 复刻真实行为（另开句柄读盘），未 flush 时断言必然失败。
+    """
+
+    async def test_small_upload_content_reaches_loader(self, monkeypatch):
+        # 约 480B，远小于 8KB 缓冲区——正是历史 bug 的触发区间
+        payload = "RAG 检索增强生成".encode("utf-8") * 40
+        seen = {}
+
+        async def _disk_loader(path):
+            # 复刻真实 loader：以新句柄读盘，验证内容确已落盘
+            with open(path, "rb") as f:
+                seen["raw"] = f.read()
+            return [Document(page_content=seen["raw"].decode("utf-8"))]
+
+        async def _fake_md5(_path):
+            return "d41d8cd98f00b204e9800998ecf8427e"
+
+        scheduled = []
+
+        async def _fake_schedule(user_id, md5, filename, content, chunks=None):
+            scheduled.append({"md5": md5, "filename": filename, "chunks": chunks})
+            return True
+
+        monkeypatch.setattr(proc_module, "txt_loader", _disk_loader)
+        monkeypatch.setattr(proc_module, "get_file_md5_hex", _fake_md5)
+        monkeypatch.setattr(
+            "app.graph.services.graph_service.maybe_schedule_doc_extraction", _fake_schedule
+        )
+
+        store = _Md5Store()
+        await DocumentProcessor(md5_store=store).get_document(
+            files=[_Upload("small.txt", payload)], user_id="u1"
+        )
+        await asyncio.sleep(0)  # 放行 create_task 排入的图谱入队任务
+
+        assert seen["raw"] == payload, "临时文件未 flush/close，loader 读到了空内容"
+        assert len(store.saved) == 1
+        assert len(scheduled) == 1
+        assert scheduled[0]["chunks"], "应携带预切切片入队"
