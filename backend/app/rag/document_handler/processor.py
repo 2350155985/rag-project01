@@ -101,6 +101,10 @@ class DocumentProcessor:
                 )
                 content = await file.read()
                 await asyncio.to_thread(temp_file_path.write, content)
+                # 必须 flush + close：NamedTemporaryFile 默认带缓冲，小文件（< 8KB 缓冲区）
+                # 写完若不落盘，后续用新句柄读取会得到空内容，导致切分为 0 块、上传静默失败。
+                await asyncio.to_thread(temp_file_path.flush)
+                await asyncio.to_thread(temp_file_path.close)
                 file_paths.append(temp_file_path.name)
                 file_names[temp_file_path.name] = file.filename
         else:

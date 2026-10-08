@@ -390,8 +390,12 @@ async def process_task(task_id: str, run_token: str | None = None) -> bool:
     except ValueError:
         payload = {}
     if source_type == "doc":
-        body = payload.get("text", "")
+        body = payload.get("text")
         chunks = payload.get("chunks")
+        # 上传管线入队时只携带预切 chunks（不含 text），此时正文由切片拼回，
+        # 否则实体抽取会拿到空正文，抽出 0 实体却仍判定成功。
+        if not body and chunks:
+            body = "\n".join(c.get("text", "") for c in chunks if c.get("text"))
     else:
         # 笔记：优先用入队时的正文（与 content_hash 一致）；force 重抽载荷为空 → 管线读 Note 表最新内容
         body = payload.get("text")

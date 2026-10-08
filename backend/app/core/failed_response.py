@@ -3,6 +3,7 @@ import re
 import traceback
 
 from fastapi import HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -119,7 +120,10 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """处理 FastAPI 参数校验异常（最常见的异常之一）"""
     # 把FastAPI的原始校验错误转换成用户友好的提示
-    error_details: list[dict] = exc.errors()
+    # jsonable_encoder 兜底：校验失败时 err 里可能带 bytes（原始请求体）或异常对象，
+    # 直接塞进 JSONResponse 会触发 "Object of type bytes is not JSON serializable"，
+    # 把本该返回的 400 友好提示变成 500。
+    error_details: list[dict] = jsonable_encoder(exc.errors())
     friendly_msg_parts = []
 
     for err in error_details:
